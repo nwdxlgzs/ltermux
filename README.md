@@ -1,7 +1,10 @@
 # ltermux
-Thread safe Lua Termux module (SVC)
+线程安全的Lua·Termux模块(SVC)
 
-# demo
+# 什么是SVC
+SVC是一条汇编指令，会导致从用户态直接陷入内核进行系统调用，跳过了libc函数的使用（当然你可以把`sys_`开头的内容去掉走libc），它有什么用呢？在这个项目里确实没啥用，只是我想内联汇编玩玩。
+
+# Lua调用示例
 ```lua
 local pty = require("ltermux")
 
@@ -62,7 +65,7 @@ else
 end
 ```
 
-# test.c
+# test.c源码
 ```c
 #include <stdio.h>
 #include <string.h>
