@@ -3,17 +3,9 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
-
 #include <dirent.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
 #include <termios.h>
-#include <unistd.h>
 #include <pthread.h>
 
 typedef struct message_t {
@@ -88,7 +80,7 @@ static void *pty_reader_thread(void *arg) {
         }
         pthread_mutex_unlock(&cb_data->queue.mutex);
 
-        bytes_read = read(cb_data->ptm_fd, buffer, sizeof(buffer) - 1);
+        bytes_read = sys_read(cb_data->ptm_fd, buffer, sizeof(buffer) - 1);
         if (bytes_read > 0) {
             buffer[bytes_read] = '\0';
             queue_push(&cb_data->queue, buffer);
