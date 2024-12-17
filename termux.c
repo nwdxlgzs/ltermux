@@ -15,7 +15,6 @@ typedef struct message_t {
     int databuffsz;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    uint8_t should_terminate;
     char BUFF[BUFFSZ_ON_STACK];
 } message_t;
 typedef struct {
