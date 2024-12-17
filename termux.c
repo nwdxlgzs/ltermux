@@ -8,63 +8,70 @@
 #include <termios.h>
 #include <pthread.h>
 
+#define BUFFSZ_ON_STACK 4096
 typedef struct message_t {
     char *data;
-    struct message_t *next;
-} message_t;
-
-typedef struct {
-    message_t *head;
-    message_t *tail;
+    int datalen;
+    int databuffsz;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     uint8_t should_terminate;
-} message_queue_t;
+    char BUFF[BUFFSZ_ON_STACK];
+} message_t;
 typedef struct {
     lua_State *L;
     int callback_ref;
     int ptm_fd;
     pthread_t thread;
     int pid;
-    message_queue_t queue;
+    message_t message;
     int should_terminate;
 } callback_data_t;
 
-static void queue_init(message_queue_t *queue) {
-    queue->head = queue->tail = NULL;
-    pthread_mutex_init(&queue->mutex, NULL);
-    pthread_cond_init(&queue->cond, NULL);
+static void msg_init(message_t *message) {
+    message->datalen = 0;
+    message->databuffsz = BUFFSZ_ON_STACK;
+    memset(message->BUFF, BUFFSZ_ON_STACK, 0);
+    message->data = message->BUFF;
+    pthread_mutex_init(&message->mutex, NULL);
+    pthread_cond_init(&message->cond, NULL);
 }
 
-static void queue_destroy(message_queue_t *queue) {
-    pthread_mutex_lock(&queue->mutex);
-    message_t *current = queue->head;
-    while (current) {
-        message_t *tmp = current;
-        current = current->next;
-        free(tmp->data);
-        free(tmp);
+static void msg_destroy(message_t *message) {
+    pthread_mutex_lock(&message->mutex);
+    if (message->data && message->data != message->BUFF) {
+        free(message->data);
     }
-    pthread_mutex_unlock(&queue->mutex);
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->cond);
+    pthread_mutex_unlock(&message->mutex);
+    pthread_mutex_destroy(&message->mutex);
+    pthread_cond_destroy(&message->cond);
 }
 
-static void queue_push(message_queue_t *queue, const char *data) {
-    message_t *msg = malloc(sizeof(message_t));
-    if (!msg) return;
-    msg->data = strdup(data);
-    msg->next = NULL;
-
-    pthread_mutex_lock(&queue->mutex);
-    if (queue->tail) {
-        queue->tail->next = msg;
-        queue->tail = msg;
+static void msg_push(message_t *message, const char *data) {
+    int datastrlen = strlen(data);
+    pthread_mutex_lock(&message->mutex);
+    if (message->data == message->BUFF) {
+        if (message->datalen + datastrlen >= BUFFSZ_ON_STACK) {
+            message->databuffsz = message->datalen + datastrlen + BUFFSZ_ON_STACK;
+            message->data = malloc(message->databuffsz);
+            memset(message->data, message->databuffsz, 0);
+            memcpy(message->data, message->BUFF, message->datalen);
+        }
     } else {
-        queue->head = queue->tail = msg;
+        message->databuffsz = message->datalen + datastrlen + BUFFSZ_ON_STACK;
+        message->data = realloc(message->data, message->databuffsz);
     }
-    pthread_cond_signal(&queue->cond);
-    pthread_mutex_unlock(&queue->mutex);
+    strcat(message->data, data);
+    pthread_cond_signal(&message->cond);
+    pthread_mutex_unlock(&message->mutex);
+}
+
+static void msg_pop_inlock(message_t *message) {
+    if (message->data == message->BUFF) {
+        message->data[0] = 0;
+    } else if (message->data)free(message->data);
+    message->data = message->BUFF;
+    message->datalen = 0;
 }
 
 static void *pty_reader_thread(void *arg) {
@@ -73,17 +80,17 @@ static void *pty_reader_thread(void *arg) {
     ssize_t bytes_read;
 
     while (1) {
-        pthread_mutex_lock(&cb_data->queue.mutex);
+        pthread_mutex_lock(&cb_data->message.mutex);
         if (cb_data->should_terminate) {
-            pthread_mutex_unlock(&cb_data->queue.mutex);
+            pthread_mutex_unlock(&cb_data->message.mutex);
             break;
         }
-        pthread_mutex_unlock(&cb_data->queue.mutex);
+        pthread_mutex_unlock(&cb_data->message.mutex);
 
         bytes_read = sys_read(cb_data->ptm_fd, buffer, sizeof(buffer) - 1);
         if (bytes_read > 0) {
             buffer[bytes_read] = '\0';
-            queue_push(&cb_data->queue, buffer);
+            msg_push(&cb_data->message, buffer);
         } else if (bytes_read == 0) {
             break;
         } else {
@@ -301,12 +308,12 @@ static int create_subprocess(lua_State *L) {
         cb_data->ptm_fd = ptm;
         cb_data->pid = pid;
         cb_data->should_terminate = 0;
-        queue_init(&cb_data->queue);
+        msg_init(&cb_data->message);
 
         // 启动读取线程
         if (pthread_create(&cb_data->thread, NULL, pty_reader_thread, cb_data) != 0) {
             sys_close(ptm);
-            queue_destroy(&cb_data->queue);
+            msg_destroy(&cb_data->message);
             free(cb_data);
             if (envp) {
                 for (int j = 0; j < env_size; ++j) free(envp[j]);
@@ -492,46 +499,34 @@ static int terminate_subprocess(lua_State *L) {
     }
 
     // 通知子线程终止
-    pthread_mutex_lock(&cb_data->queue.mutex);
+    pthread_mutex_lock(&cb_data->message.mutex);
     cb_data->should_terminate = 1;
-    pthread_cond_signal(&cb_data->queue.cond);
-    pthread_mutex_unlock(&cb_data->queue.mutex);
+    pthread_cond_signal(&cb_data->message.cond);
+    pthread_mutex_unlock(&cb_data->message.mutex);
 
     // 等待子线程结束
     pthread_join(cb_data->thread, NULL);
 
     // 处理队列中的剩余消息
-    pthread_mutex_lock(&cb_data->queue.mutex);
-    message_t *msg = cb_data->queue.head;
-    while (msg) {
-        // 获取回调函数
-        lua_rawgeti(cb_data->L, LUA_REGISTRYINDEX, cb_data->callback_ref);
-        lua_pushstring(cb_data->L, msg->data);
-        if (lua_pcall(cb_data->L, 1, 0, 0) != LUA_OK) {
-            fprintf(stderr, "Error in Lua callback: %s\n", lua_tostring(cb_data->L, -1));
-            lua_pop(cb_data->L, 1); // 移除错误消息
-        }
-        message_t *tmp = msg;
-        msg = msg->next;
-        free(tmp->data);
-        free(tmp);
+    pthread_mutex_lock(&cb_data->message.mutex);
+    lua_rawgeti(cb_data->L, LUA_REGISTRYINDEX, cb_data->callback_ref);
+    lua_pushstring(cb_data->L, cb_data->message.data);
+    if (lua_pcall(cb_data->L, 1, 0, 0) != LUA_OK) {
+        return luaL_error(L,"Error in Lua callback: %s\n", lua_tostring(L, -1));
     }
-    cb_data->queue.head = cb_data->queue.tail = NULL;
-    pthread_mutex_unlock(&cb_data->queue.mutex);
+    pthread_mutex_unlock(&cb_data->message.mutex);
 
     // 销毁队列
-    queue_destroy(&cb_data->queue);
+    msg_destroy(&cb_data->message);
 
     // 解除回调引用
     luaL_unref(cb_data->L, LUA_REGISTRYINDEX, cb_data->callback_ref);
 
     // 释放回调数据
     free(cb_data);
-
     return 0;
 }
 
-// Lua 模块函数：处理队列中的消息，并在主线程中调用回调
 static int process_messages(lua_State *L) {
     // 参数:
     // 1. cb_data (lightuserdata)
@@ -539,49 +534,29 @@ static int process_messages(lua_State *L) {
     if (!cb_data) {
         return luaL_error(L, "Invalid callback data");
     }
-
-    // 锁定队列
-    pthread_mutex_lock(&cb_data->queue.mutex);
-    message_t *msg = cb_data->queue.head;
-    while (msg) {
-        // 解除队列中的消息
-        cb_data->queue.head = msg->next;
-        if (cb_data->queue.head == NULL) {
-            cb_data->queue.tail = NULL;
-        }
-        pthread_mutex_unlock(&cb_data->queue.mutex);
-
-        // 调用 Lua 回调
-        lua_rawgeti(L, LUA_REGISTRYINDEX, cb_data->callback_ref);
-        lua_pushstring(L, msg->data);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            fprintf(stderr, "Error in Lua callback: %s\n", lua_tostring(L, -1));
-            lua_pop(L, 1); // 移除错误消息
-        }
-
-        // 释放消息
-        free(msg->data);
-        free(msg);
-
-        // 重新锁定队列
-        pthread_mutex_lock(&cb_data->queue.mutex);
-        msg = cb_data->queue.head;
+    pthread_mutex_lock(&cb_data->message.mutex);
+    char *buff = malloc(cb_data->message.datalen + 1);
+    buff[cb_data->message.datalen] = 0;
+    memcpy(buff, cb_data->message.data, cb_data->message.datalen);
+    msg_pop_inlock(&cb_data->message);
+    pthread_mutex_unlock(&cb_data->message.mutex);
+    //这里不在锁内执行，方便那边上锁，我这里用副本就好
+    lua_rawgeti(L, LUA_REGISTRYINDEX, cb_data->callback_ref);
+    lua_pushstring(L, buff);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        return luaL_error(L,"Error in Lua callback: %s\n", lua_tostring(L, -1));
     }
-    pthread_mutex_unlock(&cb_data->queue.mutex);
-
-    return 0; // 无返回值
+    // 释放缓冲区
+    free(buff);
+    return 0;
 }
 
 static int write_stdin(lua_State *L) {
     int fd = luaL_checkinteger(L, 1);
-    if (lua_isstring(L, 2)) {
-        size_t len;
-        const char *input = lua_tolstring(L, 2, &len);
-        if (sys_write(fd, input, len) != len) {
-            return luaL_error(L, "Failed to write to stdin");
-        }
-    } else {
-        return luaL_error(L, "Invalid input: must be a string");
+    size_t len;
+    const char *input = luaL_checklstring(L, 2, &len);
+    if (sys_write(fd, input, len) != len) {
+        return luaL_error(L, "Failed to write to stdin");
     }
     return 0;
 }
